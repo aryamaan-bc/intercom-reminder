@@ -1,0 +1,20 @@
+name: Intercom Daily Reminder
+
+on:
+  schedule:
+    - cron: "0 11 * * *" # 7am ET (EDT) / 6am (EST)
+  workflow_dispatch: # manual trigger from GitHub UI
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run reminder
+        run: python remind.py
+        env:
+          INTERCOM_TOKEN: ${{ secrets.INTERCOM_TOKEN }}
+          SLACK_USER_TOKEN: ${{ secrets.SLACK_USER_TOKEN }}
