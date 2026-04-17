@@ -30,6 +30,17 @@ NOTE_WINDOW_SEC = 24 * 3600
 ARYAMAAN_SLACK = "U0ASWEQBQHF"
 TAYLOR_SLACK = "U0A83N4HHSN"
 
+# Excluded email domains (test accounts, internal)
+EXCLUDED_DOMAINS = ("basiccapital.com", "textql.com")
+
+# Excluded conversation IDs (one-offs handled off-channel).
+# Tip: instead of adding IDs here, close the Intercom conversation or add
+# an admin note — both will remove it from the reminder automatically.
+EXCLUDED_CONVERSATIONS = {
+    "215473775499392",  # Daniel Brass — reached out on another chat
+    "215473563201973",  # Benjamin Bartolome — solved on call
+}
+
 # ── Intercom helpers ────────────────────────────────────────────────────
 
 
@@ -259,7 +270,7 @@ def main():
         if not ws or a.get("type") != "user":
             continue
         email = (a.get("email") or "").lower()
-        if email.endswith("@basiccapital.com"):
+        if any(email.endswith("@" + d) for d in EXCLUDED_DOMAINS):
             continue
         wait = now - int(ws)
         if wait < MIN_DAYS * 86_400 or wait > MAX_DAYS * 86_400:
@@ -271,6 +282,8 @@ def main():
     entries = []
     for c in waiting:
         cid = c["id"]
+        if str(cid) in EXCLUDED_CONVERSATIONS:
+            continue
         full = ic("GET", f"/conversations/{cid}?display_as=plaintext")
         if not full:
             continue
