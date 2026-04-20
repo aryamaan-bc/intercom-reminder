@@ -64,48 +64,59 @@ def ic(method, path, body=None):
 # ── Slack helpers ───────────────────────────────────────────────────────
 
 
-def slack_post(channel_id, text):
-    """Post a message to a Slack channel/DM using the User OAuth Token."""
-    # Open a DM conversation first (needed for user tokens)
-    open_body = json.dumps({"users": channel_id}).encode()
-    open_req = request.Request(
-        "https://slack.com/api/conversations.open",
-        data=open_body,
-        method="POST",
+def _slack_call(endpoint, body):
+    req = request.Request(
+        f"https://slack.com/api/{endpoint}", data=json.dumps(body).encode(), method="POST"
     )
-    open_req.add_header("Authorization", f"Bearer {SLACK_TOKEN}")
-    open_req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", f"Bearer {SLACK_TOKEN}")
+    req.add_header("Content-Type", "application/json")
+    with request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
+
+def slack_open_dm(user_id):
     try:
-        with request.urlopen(open_req, timeout=15) as resp:
-            dm = json.loads(resp.read())
-        dm_channel = dm.get("channel", {}).get("id")
-        if not dm_channel:
-            print(f"  Slack conversations.open failed for {channel_id}: {dm}", file=sys.stderr)
-            return False
+        dm = _slack_call("conversations.open", {"users": user_id})
+        ch = dm.get("channel", {}).get("id")
+        if not ch:
+            print(f"  Slack conversations.open failed for {user_id}: {dm}", file=sys.stderr)
+        return ch
     except Exception as e:
         print(f"  Slack conversations.open error: {e}", file=sys.stderr)
-        return False
+        return None
 
-    # Post the message
-    msg_body = json.dumps({"channel": dm_channel, "text": text}).encode()
-    msg_req = request.Request(
-        "https://slack.com/api/chat.postMessage",
-        data=msg_body,
-        method="POST",
-    )
-    msg_req.add_header("Authorization", f"Bearer {SLACK_TOKEN}")
-    msg_req.add_header("Content-Type", "application/json")
+
+def slack_post_message(channel, text, thread_ts=None):
+    """Post a message to a Slack channel. Returns the message ts on success, else None."""
+    body = {"channel": channel, "text": text}
+    if thread_ts:
+        body["thread_ts"] = thread_ts
     try:
-        with request.urlopen(msg_req, timeout=15) as resp:
-            result = json.loads(resp.read())
+        result = _slack_call("chat.postMessage", body)
         if not result.get("ok"):
             print(f"  Slack postMessage failed: {result.get('error')}", file=sys.stderr)
-            return False
-        print(f"  Slack DM sent to {channel_id}", file=sys.stderr)
-        return True
+            return None
+        return result.get("ts")
     except Exception as e:
         print(f"  Slack postMessage error: {e}", file=sys.stderr)
-        return False
+        return None
+
+
+def slack_dm(user_id, text):
+    """Back-compat: open DM and post. Returns (channel, ts) or (None, None)."""
+    ch = slack_open_dm(user_id)
+    if not ch:
+        return None, None
+    ts = slack_post_message(ch, text)
+    if ts:
+        print(f"  Slack DM sent to {user_id}", file=sys.stderr)
+    return ch, ts
+
+
+def slack_post(channel_id, text):
+    """Legacy wrapper: open DM + post, return bool."""
+    _, ts = slack_dm(channel_id, text)
+    return ts is not None
 
 
 # ── text / filter helpers ───────────────────────────────────────────────
@@ -219,6 +230,72 @@ def render(entries, suffix_note=True):
     return "\n".join(lines)
 
 
+def _fmt_when(ts):
+    try:
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return "?"
+
+
+def _is_deflection(body):
+    b = body.lower()
+    return ("another" in b and "thread" in b) or ("continue" in b and "there" in b)
+
+
+def render_enrichment(entry, full, max_turns=6, max_chars=240):
+    """Per-ticket thread reply: topics + AI title + customer/admin message arc."""
+    src = full.get("source") or {}
+    auth = src.get("author") or {}
+    topics = [(t or {}).get("name") for t in ((full.get("topics") or {}).get("topics") or [])]
+    topics = [t for t in topics if t]
+    ai_title = (full.get("custom_attributes") or {}).get("AI Title")
+
+    # Build message arc: source body (original customer msg) + subsequent parts
+    turns = []
+    src_body = txt(src.get("body") or "")
+    if src_body:
+        turns.append(("user", auth.get("name") or "Customer",
+                      src.get("delivered_at") or src.get("created_at"), src_body))
+    for p in (full.get("conversation_parts") or {}).get("conversation_parts") or []:
+        if p.get("part_type") != "comment":
+            continue
+        a = p.get("author") or {}
+        t = a.get("type")
+        if t not in ("user", "admin"):
+            continue
+        body = txt(p.get("body") or "")
+        if not body:
+            continue
+        if t == "admin" and _is_deflection(body):
+            continue
+        turns.append((t, a.get("name") or t.title(),
+                      p.get("created_at"), body))
+
+    # Keep the last `max_turns` turns (most recent context)
+    turns = turns[-max_turns:]
+
+    lines = []
+    lines.append(f"*<{entry['url']}|{entry['title']}>*  _({entry['customer']})_")
+    meta = []
+    if ai_title and ai_title != entry["title"]:
+        meta.append(f"AI title: _{ai_title}_")
+    if topics:
+        meta.append(f"Topics: {', '.join(topics)}")
+    if meta:
+        lines.append(" · ".join(meta))
+    lines.append("")
+    lines.append("*Thread arc:*")
+    for t, name, ts, body in turns:
+        label = "[customer]" if t == "user" else "[admin]"
+        snippet = body[:max_chars] + ("\u2026" if len(body) > max_chars else "")
+        # Collapse internal whitespace for Slack readability
+        snippet = re.sub(r"\s+", " ", snippet).strip()
+        lines.append(f"{label} *{name}* · {_fmt_when(ts)}")
+        lines.append(f"> {snippet}")
+    return "\n".join(lines)
+
+
 def main():
     if not INTERCOM_TOKEN:
         print("ERROR: INTERCOM_TOKEN not set", file=sys.stderr)
@@ -319,6 +396,7 @@ def main():
             "title": title,
             "url": f"https://app.intercom.com/a/inbox/{APP_ID}/inbox/shared/all/conversation/{cid}",
             "has_recent_note": has_recent_note(full, now),
+            "_full": full,
         })
 
     entries.sort(key=lambda e: -e["hours"])
@@ -330,12 +408,31 @@ def main():
     text_all = render(entries, suffix_note=True)
     text_taylor = render(entries_taylor, suffix_note=False)
 
-    # Aryamaan always
-    slack_post(ARYAMAAN_SLACK, text_all)
+    self_only = "--self-only" in sys.argv
 
-    # Taylor only if there are un-noted tickets
-    if len(entries_taylor) > 0:
-        slack_post(TAYLOR_SLACK, text_taylor)
+    def post_with_enrichment(user_id, entries_for_thread, parent_text):
+        channel = slack_open_dm(user_id)
+        if not channel:
+            return False
+        parent_ts = slack_post_message(channel, parent_text)
+        if not parent_ts:
+            return False
+        print(f"  Slack DM sent to {user_id}", file=sys.stderr)
+        for e in entries_for_thread:
+            reply = render_enrichment(e, e["_full"])
+            ok_ts = slack_post_message(channel, reply, thread_ts=parent_ts)
+            if not ok_ts:
+                print(f"  Threaded reply failed for conv at {e['url']}", file=sys.stderr)
+        return True
+
+    # Aryamaan always — post parent DM + threaded enrichment per ticket
+    post_with_enrichment(ARYAMAAN_SLACK, entries, text_all)
+
+    # Taylor only if there are un-noted tickets (and not --self-only)
+    if len(entries_taylor) > 0 and not self_only:
+        post_with_enrichment(TAYLOR_SLACK, entries_taylor, text_taylor)
+    elif self_only:
+        print("--self-only: skipping Taylor DM", file=sys.stderr)
 
     return 0
 
